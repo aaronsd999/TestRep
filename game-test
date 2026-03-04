@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Highway Dodge (Simple FPS)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b1020; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #wrap { height: 100%; display: grid; place-items: center; }
+    canvas { width: min(100vw, 900px); height: min(100vh, 700px); image-rendering: pixelated; border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+    .hud {
+      position: fixed; left: 16px; top: 14px; color: rgba(255,255,255,.92);
+      font-size: 14px; line-height: 1.35; user-select: none;
+      text-shadow: 0 1px 2px rgba(0,0,0,.45);
+    }
+    .hud b { font-weight: 700; }
+    .hint {
+      position: fixed; right: 16px; top: 14px; color: rgba(255,255,255,.78);
+      font-size: 12px; line-height: 1.35; text-align: right; user-select: none;
+      text-shadow: 0 1px 2px rgba(0,0,0,.45);
+    }
+    .center {
+      position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+      color: rgba(255,255,255,.95); text-align: center; text-shadow: 0 2px 10px rgba(0,0,0,.55);
+    }
+    .panel {
+      pointer-events: none;
+      background: rgba(0,0,0,.45);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 16px;
+      padding: 18px 18px 14px;
+      width: min(520px, calc(100vw - 40px));
+      backdrop-filter: blur(6px);
+    }
+    .panel h1 { margin: 0 0 6px; font-size: 18px; letter-spacing: .2px; }
+    .panel p { margin: 6px 0; font-size: 13px; color: rgba(255,255,255,.85); }
+    .kbd { display: inline-block; padding: 1px 7px; border-radius: 7px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="c" width="900" height="700"></canvas>
+  </div>
+
+  <div class="hud" id="hud"></div>
+  <div class="hint">
+    <div><span class="kbd">A</span>/<span class="kbd">D</span> or <span class="kbd">←</span>/<span class="kbd">→</span> steer</div>
+    <div><span class="kbd">W</span>/<span class="kbd">S</span> adjust speed</div>
+    <div><span class="kbd">Space</span> pause • <span class="kbd">R</span> restart</div>
+  </div>
+
+  <div class="center" id="overlay"></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  const hudEl = document.getElementById("hud");
+  const overlay = document.getElementById("overlay");
+
+  // --- Utility
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const pick = arr => arr[(Math.random() * arr.length) | 0];
+
+  // --- World / Road settings
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const horizonY = H * 0.30;
+  const roadBottomHalfWidth = W * 0.46;
+  const roadTopHalfWidth = W * 0.08;
+
+  const lanes = 3; // 3-lane highway
+  const laneCenters = [-1, 0, 1]; // normalized lanes (left, center, right)
+
+  // --- Player
+  const player = {
+    x: 0,          // normalized -1..1 relative to road center
+    vx: 0,
+    width: 0.18,   // normalized
+    height: 0.26,  // normalized (for collision space)
+    bob: 0
+  };
+
+  // --- Game state
+  let running = true;
+  let paused = false;
+  let crashed = false;
+
+  let score = 0;
+  let best = Number(localStorage.getItem("highwayBest") || 0);
+
+  // Speed / difficulty ramp
+  let baseSpeed = 0.55;   // world units per second
+  let speed = baseSpeed;  // actual speed (ramps)
+  let maxSpeed = 3.2;
+  let difficulty = 0;     // increases over time
+
+  // Traffic
+  const cars = [];
+  const MAX_CARS = 14;
+
+  // Spawn control: use a "time to next spawn" AND spacing rules so it feels random but fair.
+  let spawnTimer = 0;
+
+  // For non-repetitive feeling, keep a short memory of recent lane patterns
+  const patternMemory = [];
+  const PATTERN_MEM_MAX = 8;
+
+  // Input
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (["arrowleft","arrowright","arrowup","arrowdown","a","d","w","s"," ","r"].includes(k) || e.key === " ") e.preventDefault();
+    if (k === " ") { paused = !paused; }
+    if (k === "r") restart();
+    keys.add(k === " " ? "space" : k);
+  }, { passive: false });
+
+  window.addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    keys.delete(k === " " ? "space" : k);
+  });
+
+  // Resize (optional: keep internal res fixed, just CSS scales)
+  function restart() {
+    cars.length = 0;
+    player.x = 0;
+    player.vx = 0;
+    score = 0;
+    baseSpeed = 0.55;
+    speed = baseSpeed;
+    difficulty = 0;
+    spawnTimer = 0;
+    crashed = false;
+    paused = false;
+    running = true;
+    overlay.innerHTML = "";
+  }
+
+  // --- Perspective mapping
+  function roadXCenterAtY(y) {
+    // road stays centered, but you could add gentle sway; keeping straight highway:
+    return W * 0.5;
+  }
+
+  function roadHalfWidthAtY(y) {
+    const t = clamp((y - horizonY) / (H - horizonY), 0, 1);
+    return lerp(roadTopHalfWidth, roadBottomHalfWidth, t);
+  }
+
+  function worldToScreen(nx, ny) {
+    // ny: 0 at horizon, 1 at bottom
+    const y = lerp(horizonY, H, ny);
+    const cx = roadXCenterAtY(y);
+    const hw = roadHalfWidthAtY(y);
+    const x = cx + nx * hw;
+    return { x, y, hw };
+  }
+
+  // --- Traffic car model
+  // Car y is "depth": 0 near horizon, 1 near player/bottom. We move cars by increasing y.
+  function makeCar(laneIdx, y, kind = "sedan") {
+    // Slightly vary width/height by type
+    const type = kind;
+    let w = 0.16, h = 0.22;
+    if (type === "truck") { w = 0.18; h = 0.28; }
+    if (type === "compact") { w = 0.145; h = 0.20; }
+
+    return {
+      laneIdx,
+      x: laneCenters[laneIdx], // normalized lane center
+      y,                       // 0..1 depth
+      w, h,
+      color: pick(["#f9d65c","#77e6ff","#ff7aa2","#b7ff7a","#c7a7ff","#ffd1a1"]),
+      roof: "rgba(255,255,255,.12)",
+      kind: type,
+      wobble: rand(0, Math.PI * 2) // tiny lateral drift to reduce pattern feel
+    };
+  }
+
+  function chooseLaneWithVariety() {
+    // Weighted random with memory to avoid repeating same lane too often
+    // Also can sometimes spawn 2 cars across lanes as "clusters" later via logic below.
+    const weights = [1, 1, 1];
+
+    // Reduce weight for most recent lanes
+    for (let i = 0; i < Math.min(patternMemory.length, 4); i++) {
+      const recent = patternMemory[patternMemory.length - 1 - i];
+      weights[recent] *= (i === 0 ? 0.45 : 0.70);
+    }
+
+    // Add a tiny bias to avoid overusing edges all the time
+    weights[0] *= 0.95;
+    weights[2] *= 0.95;
+
+    // Normalize pick
+    const sum = weights.reduce((a,b) => a+b, 0);
+    let r = Math.random() * sum;
+    for (let i = 0; i < weights.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return i;
+    }
+    return 1;
+  }
+
+  function canSpawnInLane(laneIdx, ySpawn) {
+    // Enforce spacing: no car too close in same lane near spawn region
+    // Also enforce not creating impossible "wall" at low difficulty.
+    for (const c of cars) {
+      if (c.laneIdx !== laneIdx) continue;
+      // if another car is within ~0.18 depth, don't spawn
+      if (Math.abs(c.y - ySpawn) < 0.18) return false;
+    }
+    return true;
+  }
+
+  function laneOccupiedNear(laneIdx, y, range) {
+    for (const c of cars) {
+      if (c.laneIdx === laneIdx && Math.abs(c.y - y) < range) return true;
+    }
+    return false;
+  }
+
+  function spawnTraffic(dt) {
+    spawnTimer -= dt;
+    if (spawnTimer > 0) return;
+    if (cars.length >= MAX_CARS) return;
+
+    // Spawn interval shrinks with difficulty, but has randomness
+    // Also, if player is going super fast, spawn slightly more often.
+    const spawnBase = lerp(0.95, 0.42, clamp(difficulty / 80, 0, 1));
+    const jitter = rand(0.0, 0.35);
+    spawnTimer = spawnBase + jitter;
+
+    // Spawn at a bit above the horizon (negative y so it appears gradually)
+    const ySpawn = -0.08;
+
+    // Decide whether to create a cluster (two-lane challenge) at higher difficulty
+    const clusterChance = clamp((difficulty - 18) / 80, 0, 0.35);
+    const doCluster = Math.random() < clusterChance;
+
+    const kinds = (difficulty > 22)
+      ? ["compact","sedan","sedan","truck"]
+      : ["compact","sedan","sedan"];
+
+    const primaryLane = chooseLaneWithVariety();
+
+    const spawned = [];
+
+    // Primary
+    if (canSpawnInLane(primaryLane, ySpawn)) {
+      const car = makeCar(primaryLane, ySpawn, pick(kinds));
+      cars.push(car);
+      spawned.push(primaryLane);
+      patternMemory.push(primaryLane);
+      if (patternMemory.length > PATTERN_MEM_MAX) patternMemory.shift();
+    }
+
+    // Optional cluster: spawn a second car in adjacent lane with some separation rules
+    if (doCluster) {
+      const adj = primaryLane === 1 ? pick([0,2]) : 1;
+      const ok = canSpawnInLane(adj, ySpawn) && !laneOccupiedNear(adj, ySpawn + 0.08, 0.16);
+
+      // "Fairness" rule: don't block all 3 lanes near the player region
+      // If there is already a car near y ~0.55 in the remaining lane, skip cluster.
+      const remaining = [0,1,2].filter(i => i !== primaryLane && i !== adj)[0];
+      const remainingBusy = laneOccupiedNear(remaining, 0.55, 0.14);
+
+      if (ok && !remainingBusy) {
+        const car2 = makeCar(adj, ySpawn - rand(0.02, 0.07), pick(kinds));
+        cars.push(car2);
+        spawned.push(adj);
+        patternMemory.push(adj);
+        if (patternMemory.length > PATTERN_MEM_MAX) patternMemory.shift();
+      }
+    }
+  }
+
+  // --- Collision (in normalized road space)
+  function rectsOverlap(a, b) {
+    return (
+      a.x - a.w/2 < b.x + b.w/2 &&
+      a.x + a.w/2 > b.x - b.w/2 &&
+      a.y - a.h/2 < b.y + b.h/2 &&
+      a.y + a.h/2 > b.y - b.h/2
+    );
+  }
+
+  function update(dt) {
+    if (!running || paused) return;
+
+    // Ramp difficulty and speed
+    difficulty += dt * 1.2;
+    // speed increases but eases
+    const target = clamp(baseSpeed + difficulty * 0.022, baseSpeed, maxSpeed);
+    speed = lerp(speed, target, 0.25 * dt * 60);
+
+    // Player input
+    const left = keys.has("a") || keys.has("arrowleft");
+    const right = keys.has("d") || keys.has("arrowright");
+    const up = keys.has("w") || keys.has("arrowup");
+    const down = keys.has("s") || keys.has("arrowdown");
+
+    let steer = 0;
+    if (left) steer -= 1;
+    if (right) steer += 1;
+
+    // Steering sensitivity increases slightly with speed
+    const steerPower = lerp(1.9, 2.6, clamp(speed / maxSpeed, 0, 1));
+    player.vx = lerp(player.vx, steer * steerPower, 0.25);
+
+    // Optional speed adjust
+    if (up) baseSpeed = clamp(baseSpeed + dt * 0.20, 0.45, 1.4);
+    if (down) baseSpeed = clamp(baseSpeed - dt * 0.20, 0.35, 1.4);
+
+    player.x += player.vx * dt;
+
+    // Stay on the road (soft clamp)
+    const edge = 1.02;
+    if (player.x < -edge) { player.x = -edge; player.vx *= -0.25; }
+    if (player.x >  edge) { player.x =  edge; player.vx *= -0.25; }
+
+    // Spawn traffic
+    spawnTraffic(dt);
+
+    // Move traffic towards player
+    for (let i = cars.length - 1; i >= 0; i--) {
+      const c = cars[i];
+
+      // Cars move down faster as speed increases; add small variability per car
+      const perCar = 1 + 0.08 * Math.sin(c.wobble + difficulty * 0.9);
+      c.y += dt * speed * 0.58 * perCar;
+
+      // Tiny lateral drift (still basically in lane)
+      const drift = 0.03 * Math.sin(c.wobble + c.y * 8);
+      c.x = laneCenters[c.laneIdx] + drift;
+
+      // Remove passed cars
+      if (c.y > 1.25) cars.splice(i, 1);
+    }
+
+    // Score increases with speed and survival
+    score += dt * (10 + speed * 14);
+
+    // Collision check in normalized road space near bottom
+    const playerBox = {
+      x: player.x,
+      y: 0.94,
+      w: player.width,
+      h: player.height
+    };
+
+    for (const c of cars) {
+      // Only check collisions when car is near player depth
+      if (c.y < 0.72 || c.y > 1.02) continue;
+
+      const carBox = {
+        x: c.x,
+        y: c.y,
+        w: c.w,
+        h: c.h
+      };
+
+      if (rectsOverlap(playerBox, carBox)) {
+        crash();
+        break;
+      }
+    }
+
+    // Camera bob for feel
+    player.bob += dt * speed * 1.6;
+  }
+
+  function crash() {
+    crashed = true;
+    running = false;
+    paused = false;
+
+    best = Math.max(best, Math.floor(score));
+    localStorage.setItem("highwayBest", String(best));
+
+    overlay.innerHTML = `
+      <div class="panel">
+        <h1>💥 Crash</h1>
+        <p><b>Score:</b> ${Math.floor(score)} &nbsp; • &nbsp; <b>Best:</b> ${best}</p>
+        <p>Press <span class="kbd">R</span> to restart.</p>
+      </div>
+    `;
+  }
+
+  // --- Rendering
+  function draw() {
+    // Background sky gradient
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#07102a");
+    g.addColorStop(0.35, "#0a1538");
+    g.addColorStop(1, "#060814");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Sun glow
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath();
+    ctx.arc(W * 0.5, H * 0.18, 120, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffd08a";
+    ctx.fill();
+    ctx.restore();
+
+    // Mountains silhouette
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.beginPath();
+    ctx.moveTo(0, horizonY + 18);
+    for (let x = 0; x <= W; x += 60) {
+      const y = horizonY + 18 + Math.sin((x * 0.012) + 1.7) * 18 + Math.sin((x * 0.004) + 0.4) * 10;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    // Ground
+    ctx.fillStyle = "#07110d";
+    ctx.fillRect(0, horizonY, W, H - horizonY);
+
+    // Road polygon
+    ctx.fillStyle = "#111724";
+    ctx.beginPath();
+    ctx.moveTo(W/2 - roadTopHalfWidth, horizonY);
+    ctx.lineTo(W/2 + roadTopHalfWidth, horizonY);
+    ctx.lineTo(W/2 + roadBottomHalfWidth, H);
+    ctx.lineTo(W/2 - roadBottomHalfWidth, H);
+    ctx.closePath();
+    ctx.fill();
+
+    // Road edge lines
+    ctx.strokeStyle = "rgba(255,255,255,.20)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(W/2 - roadTopHalfWidth, horizonY);
+    ctx.lineTo(W/2 - roadBottomHalfWidth, H);
+    ctx.moveTo(W/2 + roadTopHalfWidth, horizonY);
+    ctx.lineTo(W/2 + roadBottomHalfWidth, H);
+    ctx.stroke();
+
+    // Lane dividers (dashed)
+    const dashSpeed = speed * 0.85;
+    const dashOffset = (player.bob * 120 * dashSpeed) % 120;
+
+    for (let lane = 1; lane < lanes; lane++) {
+      const nx = lerp(-1, 1, lane / lanes);
+      // draw in segments from horizon to bottom
+      for (let i = 0; i < 18; i++) {
+        const y0 = (i / 18);
+        const y1 = ((i + 1) / 18);
+        const segmentCenter = (y0 + y1) / 2;
+
+        // dashed pattern: alternate on/off with offset
+        const phase = (i * 35 + dashOffset);
+        if ((phase % 80) > 45) continue;
+
+        const p0 = worldToScreen(nx, y0);
+        const p1 = worldToScreen(nx, y1);
+
+        ctx.strokeStyle = "rgba(255,255,255,.35)";
+        ctx.lineWidth = lerp(1, 5, segmentCenter);
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+      }
+    }
+
+    // Shoulder rumble (simple repeating marks)
+    for (let side of [-1, 1]) {
+      for (let i = 0; i < 14; i++) {
+        const y0 = (i / 14);
+        const y1 = ((i + 1) / 14);
+        const segmentCenter = (y0 + y1) / 2;
+        const phase = (i * 55 + dashOffset * 1.4);
+        if ((phase % 100) > 60) continue;
+
+        const t = segmentCenter;
+        const y = lerp(horizonY, H, t);
+        const cx = roadXCenterAtY(y);
+        const hw = roadHalfWidthAtY(y);
+        const x = cx + side * (hw + lerp(10, 22, t));
+        ctx.strokeStyle = "rgba(255,255,255,.10)";
+        ctx.lineWidth = lerp(1, 4, t);
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + side * lerp(6, 14, t), y + lerp(10, 22, t));
+        ctx.stroke();
+      }
+    }
+
+    // Draw traffic cars from far to near (sort by y)
+    const sorted = [...cars].sort((a,b) => a.y - b.y);
+    for (const c of sorted) drawCar(c);
+
+    // Draw player hood / cockpit (bottom overlay)
+    drawPlayerHood();
+
+    // HUD
+    hudEl.innerHTML = `
+      <div><b>Score:</b> ${Math.floor(score)}</div>
+      <div><b>Speed:</b> ${speed.toFixed(2)}x</div>
+      <div><b>Best:</b> ${best}</div>
+      <div style="opacity:.75">${paused ? "Paused" : crashed ? "Crashed" : "Running"}</div>
+    `;
+
+    // Pause overlay
+    if (paused && running) {
+      overlay.innerHTML = `
+        <div class="panel">
+          <h1>Paused</h1>
+          <p>Press <span class="kbd">Space</span> to resume.</p>
+        </div>
+      `;
+    } else if (!crashed) {
+      overlay.innerHTML = "";
+    }
+  }
+
+  function drawCar(c) {
+    // Map car normalized coords to screen with perspective
+    const p = worldToScreen(c.x, c.y);
+    const t = clamp(c.y, 0, 1);
+
+    // Scale with depth
+    const scale = lerp(0.20, 1.05, Math.pow(t, 1.15));
+    const carW = (p.hw * c.w) * scale;
+    const carH = (p.hw * c.h) * scale;
+
+    const x = p.x - carW / 2;
+    const y = p.y - carH;
+
+    // Shadow
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y - carH * 0.1, carW * 0.52, carH * 0.16, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Body
+    ctx.fillStyle = c.color;
+    roundRect(ctx, x, y, carW, carH, Math.max(6, carW * 0.12));
+    ctx.fill();
+
+    // Windshield / roof highlight
+    ctx.fillStyle = c.roof;
+    roundRect(ctx, x + carW*0.14, y + carH*0.14, carW*0.72, carH*0.28, Math.max(6, carW*0.12));
+    ctx.fill();
+
+    // Tail lights (near bottom)
+    ctx.fillStyle = "rgba(255,70,70,.75)";
+    roundRect(ctx, x + carW*0.14, y + carH*0.78, carW*0.18, carH*0.12, 6);
+    ctx.fill();
+    roundRect(ctx, x + carW*0.68, y + carH*0.78, carW*0.18, carH*0.12, 6);
+    ctx.fill();
+
+    // Border
+    ctx.strokeStyle = "rgba(0,0,0,.35)";
+    ctx.lineWidth = Math.max(1, carW*0.02);
+    ctx.stroke();
+
+    // Kind marker (subtle)
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = "#000";
+    ctx.font = `${Math.max(10, carW*0.18)}px system-ui`;
+    ctx.textAlign = "center";
+    ctx.fillText(c.kind === "truck" ? "▮" : c.kind === "compact" ? "•" : "▭", p.x, y + carH*0.55);
+    ctx.restore();
+  }
+
+  function drawPlayerHood() {
+    // Simple hood/cockpit to give FPS feel
+    const bob = Math.sin(player.bob) * 3.5;
+
+    // Vignette
+    const vg = ctx.createRadialGradient(W/2, H*0.7, 120, W/2, H*0.7, 520);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,.45)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    // Hood
+    const hoodY = H * 0.80 + bob;
+    ctx.fillStyle = "#0c0f18";
+    ctx.beginPath();
+    ctx.moveTo(W*0.18, H);
+    ctx.quadraticCurveTo(W*0.5, hoodY, W*0.82, H);
+    ctx.closePath();
+    ctx.fill();
+
+    // Hood highlight
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(W*0.25, H);
+    ctx.quadraticCurveTo(W*0.5, hoodY + 20, W*0.75, H);
+    ctx.stroke();
+    ctx.restore();
+
+    // Steering effect: slight camera shift based on player.x
+    // We'll add a subtle overlay shift in road feel by drawing a transparent layer
+    ctx.save();
+    ctx.globalAlpha = 0.06;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(W/2 + player.x * 18, 0, 1, H);
+    ctx.restore();
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    r = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // --- Main loop
+  let last = performance.now();
+  function frame(now) {
+    const dt = clamp((now - last) / 1000, 0, 0.05);
+    last = now;
+
+    if (!crashed) update(dt);
+    draw();
+
+    requestAnimationFrame(frame);
+  }
+
+  // Start screen
+  overlay.innerHTML = `
+    <div class="panel">
+      <h1>Highway Dodge (Simple FPS)</h1>
+      <p>Dodge traffic as your speed ramps up. The pattern is randomized with spacing rules so it stays fair but not repetitive.</p>
+      <p>
+        Steer: <span class="kbd">A</span>/<span class="kbd">D</span> or <span class="kbd">←</span>/<span class="kbd">→</span> •
+        Pause: <span class="kbd">Space</span>
+      </p>
+      <p>Press any steering key to start rolling.</p>
+    </div>
+  `;
+
+  // Auto-start on first steer
+  const startWatcher = () => {
+    if (keys.has("a") || keys.has("d") || keys.has("arrowleft") || keys.has("arrowright")) {
+      overlay.innerHTML = "";
+      window.removeEventListener("keydown", startWatcher);
+    }
+  };
+  window.addEventListener("keydown", startWatcher);
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
